@@ -14636,13 +14636,60 @@ audioEditReleaseBtn.addEventListener('click', function (e) { e.stopPropagation()
 var hitCanvas = null
 var hitReady = false
 var hitFailed = false // 命中图加载失败（如图片 404/资源缺失）：退回矩形区域判定，绝不吞掉整页事件
+// ===== v755：命中判定不再"必须有画布像素" =====
+// 起因（Firefox 上"能渲染、任务结束气泡正常，但点/拖/菜单全都没反应"）：
+// 交互只有一道门 —— 所有 pointerdown/click/菜单按钮显形都要先过 isWhaleHit()，
+// 而它原来**完全依赖** hitCanvas.getImageData() 的 alpha。Gecko 在隐私保护下会阻断画布读回：
+// privacy.resistFingerprinting（ETP「严格」、LibreWolf/Tor/Mullvad/Zen 等加固版默认开）
+// 会把 getImageData/toDataURL 的结果抹成空白（Mozilla 已把这项保护从 toDataURL 扩到 getImageData），
+// 于是 data[3] 恒为 0 → isWhaleHit 恒为 false → 点不动、拖不动、☰ 永不显形；
+// 而渲染与轮询驱动的任务结束气泡完全不经过这道门，所以看起来"除了交互都正常"。
+// 现在分两层：几何盒（永远可用，只依赖 getBoundingClientRect）做判定，
+// 画布像素**只在真能读到时**用来把透明区还回页面（保持原有穿透手感）。
+var hitNat = { w: 0, h: 0 } // 命中图原始尺寸（几何判定要用它的宽高比）
+var hitPixelUsable = false // 画布像素读回是否真的可用（自检得出）
+var hitPixelWarned = false
+var hitProbeTimer = null
+function hitWarnOnce(reason) {
+  if (hitPixelWarned) return
+  hitPixelWarned = true
+  try { console.warn('[小鲸鱼] 画布像素命中不可用（' + reason + '）→ 已退回几何命中判定，交互不受影响；如需像素级透明穿透请放行本站的画布读取。') } catch (err) {}
+}
+// 画完立刻自检：整张角色图不可能一个不透明像素都没有。
+// 采不到任何不透明像素 ⇒ 读回被阻断/抹白（而不是"图是透明的"）。
+function hitDetectPixelReadback(ctx) {
+  try {
+    var d = ctx.getImageData(0, 0, 610, 610).data
+    for (var i = 3; i < d.length; i += 4 * 7) { if (d[i] > 10) return true }
+    return false
+  } catch (err) { return false }
+}
+// 几何命中盒：按 object-fit:contain + object-position:right bottom 算出图像真正画出来的矩形。
+// 拿不到原始尺寸（图没加载成功）时退回整个 <img> 的盒子 —— 与原来"加载失败退矩形"的取舍一致。
+function hitGeoBox() {
+  try {
+    var r = img.getBoundingClientRect()
+    if (!r || r.width <= 0 || r.height <= 0) return null
+    var iw = hitNat.w, ih = hitNat.h
+    if (!(iw > 0) || !(ih > 0)) return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }
+    var scale = Math.min(r.width / iw, r.height / ih)
+    var dw = iw * scale, dh = ih * scale
+    return { left: r.right - dw, right: r.right, top: r.bottom - dh, bottom: r.bottom }
+  } catch (err) { return null }
+}
+function hitInBox(e, b) {
+  return !!b && e.clientX >= b.left && e.clientX <= b.right && e.clientY >= b.top && e.clientY <= b.bottom
+}
 function setupHitTest(url) {
   try {
+    if (hitProbeTimer) { try { clearTimeout(hitProbeTimer) } catch (err) {} hitProbeTimer = null }
     hitCanvas = document.createElement('canvas')
     hitCanvas.width = 610
     hitCanvas.height = 610
     hitReady = false
     hitFailed = false
+    hitPixelUsable = false
+    hitNat = { w: 0, h: 0 }
     var probe = new Image()
     probe.onload = function () {
       try {
@@ -14657,44 +14704,74 @@ function setupHitTest(url) {
         var dx = 610 - dw // right bottom
         var dy = 610 - dh
         ctx.drawImage(probe, dx, dy, dw, dh)
+        hitNat = { w: iw, h: ih }
+        hitPixelUsable = hitDetectPixelReadback(ctx)
+        if (!hitPixelUsable) hitWarnOnce('画布读回被浏览器隐私保护阻断、或返回空数据')
         hitReady = true
       } catch (err) {
         hitFailed = true
+        hitWarnOnce('命中图绘制失败：' + String((err && err.message) || err))
+      } finally {
+        if (hitProbeTimer) { try { clearTimeout(hitProbeTimer) } catch (err) {} hitProbeTimer = null }
       }
     }
     probe.onerror = function () {
       // 图片加载失败：不能把整页当成鲸鱼命中区吞掉事件（会全页面点不动），
       // 标记失败，命中判定退回图像矩形区域。
       hitFailed = true
+      if (hitProbeTimer) { try { clearTimeout(hitProbeTimer) } catch (err) {} hitProbeTimer = null }
     }
     probe.src = url || IMG_URL
-  } catch (err) {}
+    // 兜底：既不 onload 也不 onerror（图挂着不返回）时，不能让交互无限期停摆
+    hitProbeTimer = setTimeout(function () {
+      hitProbeTimer = null
+      if (!hitReady && !hitFailed) { hitFailed = true; hitWarnOnce('命中图 3 秒内既未加载成功也未报错') }
+    }, 3000)
+  } catch (err) {
+    hitFailed = true // 连画布都建不出来：直接走几何判定，绝不让交互死掉
+    hitWarnOnce('命中图初始化失败：' + String((err && err.message) || err))
+  }
 }
 function isWhaleHit(e) {
-  // 命中图未就绪/失败时：绝不默认“全屏都是鲸鱼”。
-  // 加载中 → 返回 false（不拦截页面）；加载失败 → 退回图像矩形区域，仅挂件区域可拖。
-  if (!hitCanvas || !hitReady) {
-    if (!hitFailed) return false
-    try {
-      var fr = img.getBoundingClientRect()
-      if (!fr || fr.width <= 0 || fr.height <= 0) return false
-      return e.clientX >= fr.left && e.clientX <= fr.right && e.clientY >= fr.top && e.clientY <= fr.bottom
-    } catch (err) {
-      return false
-    }
+  // v755：判定顺序改成"几何盒粗筛 → 画布像素精修"，任何一层不可用都不再让交互死掉。
+  // 原实现只有像素一条路，读回被阻断（Firefox 隐私保护）时恒 false，整条交互链静默失效。
+  var box = hitGeoBox()
+  if (!hitInBox(e, box)) return false
+  // 画布还没就绪：加载中先不抢页面事件（保持原有语义：不默认"全屏都是鲸鱼"）。
+  // 失败/超时/像素读回不可用 → 用几何盒，交互照常。
+  if (!hitCanvas || !hitReady || !hitPixelUsable) {
+    if (hitCanvas && !hitReady && !hitFailed) return false
+    return true
   }
   try {
     var r = img.getBoundingClientRect()
-    if (!r || r.width <= 0 || r.height <= 0) return false
+    if (!r || r.width <= 0 || r.height <= 0) return true
     var lx = (e.clientX - r.left) / r.width * 610
     var ly = (e.clientY - r.top) / r.height * 610
-    if (lx < 0 || ly < 0 || lx >= 610 || ly >= 610) return false
+    if (lx < 0 || ly < 0 || lx >= 610 || ly >= 610) return true
     if (state.flip) lx = 610 - lx
     var data = hitCanvas.getContext('2d').getImageData(Math.floor(lx), Math.floor(ly), 1, 1).data
     return data[3] > 10
   } catch (err) {
-    return false
+    // 读回中途被拒（tainted / 权限变化）：永久降级到几何判定，并留下一次可见告警。
+    hitPixelUsable = false
+    hitWarnOnce('getImageData 抛错：' + String((err && err.message) || err))
+    return true
   }
+}
+// 诊断入口：在 Firefox 控制台里 __dshwvHitDiag() 可直接看出走的是哪条路径
+// （hitPixelUsable=false 即"画布读回被隐私保护阻断"，此时交互由几何盒保证）。
+window.__dshwvHitDiag = function (x, y) {
+  try {
+    return {
+      hitReady: hitReady,
+      hitFailed: hitFailed,
+      hitPixelUsable: hitPixelUsable,
+      nat: { w: hitNat.w, h: hitNat.h },
+      box: hitGeoBox(),
+      at: typeof x === 'number' ? isWhaleHit({ clientX: x, clientY: y }) : null,
+    }
+  } catch (err) { return String(err) }
 }
 function onDocPointerDown(e) {
   if (e.target && e.target.closest) {
