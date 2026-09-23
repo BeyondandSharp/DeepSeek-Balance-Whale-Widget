@@ -99,6 +99,13 @@ window.__dshWhaleInit = true
 // 衔接时机由 RELEASE_LEAD_MS 决定（0 = 正好接上；30/50 = 轻微交叠）—— 改这个数字即可按耳朵微调，
 // 不用动任何逻辑。
 var dshwvAudioCtx = null
+// v754：**第一次真实用户手势之前，绝不构造 AudioContext、也不 resume()**。
+// Firefox 把这种调用记成控制台**错误级**日志（就是"运行不正常"的表象）：
+//   「AudioContext was not allowed to start. It must be created or resumed after
+//     a user gesture on the page.」
+// 并且它会分别指向构造函数与 resume 两处 —— 每次加载刷两条。
+// 手势前只预取音频**字节**（fetch 与自动播放策略无关），手势后 dshwvAudioArm() 再建 context 并解码。
+var dshwvAudioArmed = false
 // v753（issue #135）：**running 状态的 AudioContext 会让系统一直挂着 PreventUserIdleSystemSleep** ——
 // macOS 上表现为"只要页面开着就不会空闲睡眠"，而且与**有没有出声无关**（context 一 running 就持有播放流）。
 // 所以空闲 DSHW_AUDIO_IDLE_MS 之后主动 suspend()；下次出声前 dshwvAudio() 里的 resume() 会自动恢复。
@@ -127,6 +134,9 @@ function dshwvSoundOff() {
 }
 function dshwvAudio() {
   try {
+    // v754：手势之前直接返回 null（不构造、不 resume）。见上面 dshwvAudioArmed 的说明。
+    // 返回 null 与原先"拿不到 context"的语义一致 —— 所有调用方本来就都判空。
+    if (!dshwvAudioArmed) return null
     if (!dshwvAudioCtx) {
       var AC = window.AudioContext || window.webkitAudioContext
       // 显式用 'interactive'（该 API 的最低延迟档），起播尽量贴手
@@ -137,7 +147,8 @@ function dshwvAudio() {
     return dshwvAudioCtx
   } catch (err) { return null }
 }
-var dshwvAudioBuffers = {} // url -> Promise<AudioBuffer>（同一片段不重复下载/解码）
+var dshwvAudioRaw = {} // v754：url -> Promise<ArrayBuffer>（手势前就能预取：fetch 不需要 AudioContext）
+var dshwvAudioBuffers = {} // url -> Promise<AudioBuffer>（同一片段不重复解码）
 var dshwvAudioDecoded = {} // url -> AudioBuffer（解码完成后**同步可读**：起播走同步路径的关键）
 // v752：音频失败**必须看得见**。原来所有 fetch/decode 失败都被 `.catch(function(){})` 吞掉，
 // 于是"没声音"在控制台里一点痕迹都没有，只能靠猜。现在每个 URL 只 warn 一次，
@@ -152,13 +163,15 @@ function dshwvAudioWarn(url, err) {
   try { console.warn('[小鲸鱼] 音频加载/解码失败：' + url + ' → ' + msg) } catch (e) {}
 }
 function nowMs() { try { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now() } catch (err) { return Date.now() } }
-function dshwvAudioBuffer(url) {
+// v754：把"下载字节"和"解码"拆成两步 —— 手势之前只允许做前者。
+var WAIT_GESTURE = 'WAIT_GESTURE' // 手势未到：不是失败，不写 warn（否则每次加载都刷一条假报错）
+// v752：改 no-store。原来用 force-cache —— 万一某个中间层把一次空的 204 缓存住，
+// 之后每次点按都会复用它（表现就是"永久没声音，重启也没用"）。我们本来就有内存缓存，
+// 不会因此重复下载。
+function dshwvAudioRawBytes(url) {
   if (!url) return Promise.reject(new Error('empty url'))
-  if (!dshwvAudioBuffers[url]) {
-    // v752：改 no-store。原来用 force-cache —— 万一某个中间层把一次空的 204 缓存住，
-    // 之后每次点按都会复用它（表现就是"永久没声音，重启也没用"）。我们本来就有内存解码缓存，
-    // 不会因此重复下载。
-    dshwvAudioBuffers[url] = fetch(url, { cache: 'no-store' })
+  if (!dshwvAudioRaw[url]) {
+    dshwvAudioRaw[url] = fetch(url, { cache: 'no-store' })
       .then(function (r) {
         // 注意：204 也满足 r.ok（2xx），必须单独挡掉，否则 0 字节会被送进 decodeAudioData
         // → 抛 EncodingError（"Unable to decode audio data"）→ 只剩静音。
@@ -168,12 +181,35 @@ function dshwvAudioBuffer(url) {
       })
       .then(function (raw) {
         if (!raw || raw.byteLength < 100) throw new Error('音频响应只有 ' + (raw ? raw.byteLength : 0) + ' 字节（不是有效音频）')
+        return raw
+      })
+      .catch(function (err) {
+        delete dshwvAudioRaw[url] // 只缓存成功结果：失败后下次调用会重新下载
+        dshwvAudioWarn(url, err)
+        throw err
+      })
+  }
+  return dshwvAudioRaw[url]
+}
+function dshwvAudioBuffer(url) {
+  if (!url) return Promise.reject(new Error('empty url'))
+  if (!dshwvAudioBuffers[url]) {
+    dshwvAudioBuffers[url] = dshwvAudioRawBytes(url)
+      .then(function (raw) {
         var c = dshwvAudio()
-        if (!c) throw new Error('no audio context')
-        return new Promise(function (res, rej) { c.decodeAudioData(raw, res, rej) })
+        // 手势还没发生（v754）：静默失败。字节已预取好，dshwvAudioArm() 会在手势后重解一次。
+        if (!c) throw new Error(WAIT_GESTURE)
+        // decodeAudioData 可能 detach 入参 → 传副本，保住缓存里的原始字节，重试就不必再下载
+        return new Promise(function (res, rej) { c.decodeAudioData(raw.slice(0), res, rej) })
       })
       .then(function (buf) { dshwvAudioDecoded[url] = buf; return buf })
-      .catch(function (err) { delete dshwvAudioBuffers[url]; delete dshwvAudioDecoded[url]; dshwvAudioWarn(url, err); throw err })
+      .catch(function (err) {
+        delete dshwvAudioBuffers[url]
+        if (err && err.message === WAIT_GESTURE) throw err // 静默：等手势，不算失败
+        delete dshwvAudioDecoded[url]
+        dshwvAudioWarn(url, err)
+        throw err
+      })
   }
   return dshwvAudioBuffers[url]
 }
@@ -184,12 +220,36 @@ function dshwvWarm(urls) {
   // v753（issue #135）：音效关掉时**连预热都不做** —— 只跳过下面那句 dshwvAudio() 是不够的，
   // 因为预解码走到 dshwvAudioBuffer() 里还会再调一次 dshwvAudio()，context 照样被建起来。
   if (dshwvSoundOff()) return
-  try { dshwvAudio() } catch (err) {}
-  for (var i = 0; i < (urls || []).length; i++) {
-    var u = urls[i]
-    if (!u) continue
-    try { dshwvAudioBuffer(u).catch(function () {}) } catch (err) {}
+  var list = []
+  for (var n = 0; n < (urls || []).length; n++) if (urls[n]) list.push(urls[n])
+  if (!dshwvAudioArmed) {
+    // v754：手势前只预取字节。fetch 不碰自动播放策略，控制台不会再出现
+    // 「AudioContext was not allowed to start」；字节先就位，手势一到就能立刻解码。
+    for (var k = 0; k < list.length; k++) { try { dshwvAudioRawBytes(list[k]).catch(function () {}) } catch (err) {} }
+    return
   }
+  try { dshwvAudio() } catch (err) {}
+  for (var i = 0; i < list.length; i++) {
+    try { dshwvAudioBuffer(list[i]).catch(function () {}) } catch (err) {}
+  }
+}
+// v754：第一次真实用户手势到达 —— 此刻才允许构造 AudioContext / resume()。
+// 手势前 dshwvWarm() 已经把音频字节下好了，这里顺手解码，让"第一次点按"仍尽量走
+// dshwvSound 的同步起播路径（否则首次点按要多等一次 decode）。
+function dshwvAudioArm() {
+  var first = !dshwvAudioArmed
+  dshwvAudioArmed = true // "手势已发生"与音效开关无关，先记下来
+  if (dshwvSoundOff()) return // 音效关着：连 context 都不建（#135 的约定）
+  // 即便是后续调用（例如"手势时音效是关的、之后把开关打开"），也要确保 context 就位：
+  // 那次点击本身就是手势，firefox 不会把它判成自动开始。
+  try { dshwvAudio() } catch (err) {}
+  if (!first) return // context 早就建好了，重复解码没有意义
+  try {
+    var urls = Object.keys(dshwvAudioRaw)
+    for (var i = 0; i < urls.length; i++) {
+      try { dshwvAudioBuffer(urls[i]).catch(function () {}) } catch (err) {}
+    }
+  } catch (err) {}
 }
 function dshwvSoundStop(el) {
   el._token = (el._token || 0) + 1
@@ -291,8 +351,10 @@ try {
   var dshwvAudioUnlock = function () {
     // v753（issue #135）：音效关掉时**不预解锁** —— 否则一次普通点击就会把 context 转成 running，
     // 断言照挂。注意这里**不摘监听**：之后重新打开开关，下一次点击仍能完成解锁。
+    // v754：先记录"手势已发生"（音效关着时 dshwvAudioArm 只置位、不建 context），
+    // 再决定是否摘监听：关着就不摘，等开关打开后的下一次点击仍能完成解锁。
+    dshwvAudioArm()
     if (dshwvSoundOff()) return
-    dshwvAudio()
     try { document.removeEventListener('pointerdown', dshwvAudioUnlock, true) } catch (err) {}
     try { document.removeEventListener('keydown', dshwvAudioUnlock, true) } catch (err) {}
   }
@@ -12785,6 +12847,9 @@ function setSoundOn(v) {
   if (!soundOn) {
     dshwvAudioSuspendNow()
   } else {
+    // v754：打开音效的这次点击本身就是手势 → 先置位再预热。否则手势前 dshwvWarm 只会预取字节，
+    // context 要等到下一次手势才建，这中间的首次点按会没声音。
+    try { dshwvAudioArm() } catch (err) {}
     try { applySoundSet() } catch (err) {}
   }
   try {
